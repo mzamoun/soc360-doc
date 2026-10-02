@@ -1,0 +1,613 @@
+### 2026-10-01 10:34:35 — Absence rejetée impossible à valider depuis le CRA (01_TODO_01)
+
+**Rappel de la demande**
+- Un utilisateur a soumis son CRA contenant une absence « non valide » à son manager.
+- Le manager clique sur le bouton « Valider l'absence » : le statut de l'absence reste « Rejetée ».
+- Le manager clique sur « Valider le cra », une boîte de dialogue s'ouvre, il clique sur
+  « Valider l'absence » : le statut reste encore « Rejetée ».
+
+**Cause racine**
+Une absence liée à un CRA rejetée par le manager restait définitivement `REJECTED` :
+- `CraService.submitLinkedAbsences` ne resoumettait au manager que les absences `DRAFT` ; une
+  absence `REJECTED` n'était donc jamais remise en attente quand le consultant resoumettait son
+  CRA (après rejet du CRA) — l'absence restait « Rejetée » alors que le CRA repartait `SUBMITTED`.
+- `UnavailabilityService.validate` n'acceptait que le statut `SUBMITTED` : le bouton
+  « Valider l'absence » renvoyait un 400 « Seule une indisponibilité soumise peut être validée »
+  et le statut ne changeait pas.
+- `CraService.requireLinkedAbsencesValidated` compte les absences `DRAFT`, `SUBMITTED` et
+  `REJECTED` comme « en attente » : le CRA ne pouvait donc plus jamais être validé → blocage
+  définitif (deadlock) que l'on retrouvait en cliquant « Valider le cra » puis « Valider l'absence ».
+
+**Correctifs**
+- `CraService.submitLinkedAbsences` : resoumet les absences liées `DRAFT` **et** `REJECTED`
+  (`UnavailabilityService.submit` autorisait déjà ces deux statuts). Une absence rejetée repart
+  donc en `SUBMITTED` et notifie de nouveau le manager quand le consultant resoumet son CRA.
+- `UnavailabilityService.validate` : accepte `SUBMITTED` **ou** `REJECTED` via le nouveau garde-fou
+  `requireValidatable` (message « Seule une indisponibilité soumise ou rejetée peut être validée »).
+  Le rejet étant une décision du manager, il peut le lever sans repasser par le consultant. Le
+  `rejectedReason` est effacé lors de la validation.
+- `UnavailabilityService.submit` : efface aussi le `rejectedReason` (le motif de rejet ne vaut plus
+  dès que l'absence repart en validation).
+- Frontend `CraDetail.tsx` : `pendingAbsences` calculé une fois ; la popup
+  `PendingAbsencesModal` se ferme automatiquement dès qu'il ne reste plus d'absence à valider,
+  ce qui laisse le manager enchaîner sur la validation du CRA.
+- Aucun changement de schéma (aucune nouvelle migration Flyway) ; isolation multi-société inchangée
+  (les appels restent filtrés par `SecurityUtils.requireSocAccess` dans `UnavailabilityService`).
+
+**Tests ajoutés** (4 backend, 2 frontend)
+- `CraServiceTest.submit_afterLinkedAbsenceRejected_resubmitsTheAbsence` — le consultant resoumet
+  le CRA après rejet de l'absence : l'absence repasse `SUBMITTED` (échouait avant le correctif :
+  `expected: <SUBMITTED> but was: <REJECTED>`).
+- `CraServiceTest.validate_afterAbsenceRejectedThenResubmitted_succeeds` — parcours complet :
+  rejet absence + rejet CRA → resoumission → validation de l'absence → validation du CRA
+  `VALIDATED`.
+- `UnavailabilityServiceTest.validate_rejectedUnavailabilityIsAcceptedAndClearsReason`.
+- `UnavailabilityServiceTest.validate_draftUnavailabilityIsRejected` (DRAFT toujours refusé).
+- `UnavailabilityServiceTest.validate_alreadyValidatedUnavailabilityIsRejected`.
+- `UnavailabilityServiceTest.submit_rejectedUnavailabilityClearsTheRejectionReason`.
+- `CraDetail.test.tsx` : le manager peut valider une absence liée « Rejetée » (le CRA est rechargé
+  et le badge passe à « Validée ») ; la popup des indispos se ferme une fois toutes validées et
+  « Valider tout » déclenche bien la validation du CRA.
+
+**Vérification** : backend — `CraServiceTest` 76/76, `UnavailabilityServiceTest` 32/32 ; **suite
+complète 381 tests**, seul échec `SecurityIntegrationTest.adminCannotDeleteActiveUser` — pré-existant
+et order-dependent (attendu 400, obtenu 403), **vert en isolation** (17/17). Frontend — 24 fichiers /
+207 tests OK, oxlint sans erreur, `npm run build` OK.
+Vérification live (backend redémarré sur H2, profil local, Flyway à jour) : login `dev1` /
+`manager1`, CRA mars 2027 → déclaration d'absence → soumission → rejet de l'absence par le manager
+→ rejet du CRA → resoumission par le consultant (absence `SUBMITTED`) → « Valider l'absence » **200
+VALIDATED** (avant : 400) → « Valider le cra » **200 VALIDATED**. Données de test laissées inertes :
+CRA id 562 et absence id 239 en `VALIDATED`, refusés à la suppression par les gardes de l'API.
+
+### 2026-10-01 10:54:39 — « Ajouter une absence » échouait (400 sur PUT /cras/{id}/days) (01_TODO_01)
+
+**Rappel de la demande**
+- En voulant ajouter une absence dans un CRA, le front remontait `PUT /api/cras/433/days 400
+  (Bad Request)` (pile : `cras.ts:27` → `CraDetail.tsx:492` (`doSave`) ← `CraDetail.tsx:570`
+  (`handleDeclareAbsence`) ← `CraDetail.tsx:1290` (`AbsenceModal.onSubmit`)).
+
+**Cause racine**
+`handleDeclareAbsence` enregistre d'abord le CRA (`doSave` → `PUT /cras/{id}/days`) avant de
+déclarer l'absence. Or `CraService.save` refuse, pour un consultant, tout jour couvert par une
+indisponibilité **validée** qui ne porte pas que des événements `valid=true`
+(« Ce jour est couvert par une indisponibilité validée et n'est pas modifiable »).
+Les jours de congé issus d'une absence liée étaient écrits `valid=false` par
+`applyAbsence` au moment de l'intégration (l'absence était alors `DRAFT`/`SUBMITTED`), et ce
+drapeau n'était jamais remis à jour lorsque le manager validait ensuite l'absence. Le DTO renvoyait
+donc `valid=false`, le client les réémettait tels quels, et la garde refusait le save — bloquant
+toute nouvelle déclaration d'absence sur un CRA contenant une absence déjà validée.
+
+**Correctifs**
+- Backend `CraService.toDto` : pour un jour `LEAVE`/`SICK_LEAVE` couvert par une indisponibilité
+  validée (`validatedUnavailabilityDates`), les événements sont exposés `valid=true`. Le DTO reflète
+  ainsi toujours l'état réel de l'indisponibilité (y compris pour les données historiques où le
+  drapeau stocké est resté `false`) et satisfait l'invariant exigé par la garde de `save`. Aucune
+  écriture, aucun changement de schéma.
+- Backend `UnavailabilityService.validate` : nouvelle `markLinkedTimesheetEventsValid` — lorsque
+  l'indisponibilité validée est rattachée à un CRA (`timesheet`), les événements des jours couverts
+  passent à `valid=true` (entités managées, flush à la transaction). La donnée stockée devient
+  cohérente avec l'indisponibilité, au lieu de dépendre du seul DTO.
+- Aucun changement de frontend : le comportement « enregistrer puis déclarer » est conservé ; c'est
+  la réponse 400 qui était fautive. Isolation multi-société inchangée (accès via
+  `SecurityUtils.requireSocAccess` / `effectiveSocId`).
+
+**Tests ajoutés** (1 backend)
+- `CraServiceTest.save_afterLinkedAbsenceValidated_isAllowed` : parcours fidèle au front —
+  `declareAbsence` → save en préservant les jours de congé → `submit` → validation de l'absence par
+  le manager (sans valider le CRA) → rejet du CRA → le consultant relit le DTO et rejoue exactement
+  le `PUT /days` du front. Vérifie au passage que les jours couverts sont `valid=true`.
+  Échouait avant le correctif (`les jours couverts par l'absence validée doivent être validés`),
+  et la garde levait le 400.
+- Helper de test `saveFilledPreservingLeave` (remplit les jours travaillés en conservant les jours
+  de congé, comme le front) et `createDevActivity` extrait de `saveFullyFilled`.
+
+**Vérification** : backend — `CraServiceTest` 77/77, `UnavailabilityServiceTest` 32/32 ; **suite
+complète 382 tests**, seul échec `SecurityIntegrationTest.adminCannotDeleteActiveUser` — pré-existant
+et order-dependent (attendu 400, obtenu 403), vert en isolation. Frontend — inchangé : 24 fichiers /
+207 tests OK, oxlint 0 erreur.
+Vérification live (backend redémarré sur H2, profil local, Flyway 95) : `dev1`/`manager1`, CRA
+avril 2027 → déclaration d'absence → save + `submit` → le manager valide l'absence (sans valider le
+CRA) puis rejette le CRA → le consultant rouvre le CRA (jour d'absence `LEAVE`, `unavailable=true`,
+événement `valid=true`) → **`PUT /cras/626/days` 200** (avant : 400) → nouvelle déclaration
+d'absence **200**. Contrôle complémentaire sur une donnée historique réelle (CRA 594, consultant 35) :
+les jours couverts (01-02/09 et 21-27/09) sont bien exposés `valid=true`. Données de test laissées
+inertes : CRA 626 (rejeté, absences liées 303 `VALIDATED` et 304 `DRAFT`), CRA 562 restant de la
+tâche précédente.
+
+### 2026-10-01 11:00:11 — « Supprimer tous les événements » ne doit pas supprimer les événements validés (01_TODO_02)
+
+**Rappel de la demande**
+- Page CRA, en tant que propriétaire du CRA : cliquer sur « Supprimer tous les événements » ne doit
+  pas supprimer les événements validés.
+
+**Constat**
+- Le comportement était déjà implémenté côté front : `CraDetail.removeAllEvents()` conserve les
+  événements `valid` (`activities.filter(a => a.valid)`) et ne retire que les non validés (tests
+  existants « un consultant ne peut pas supprimer les événements validés » / « un manager ne
+  supprime pas les événements validés »).
+- Le trou restant venait du même défaut de données que `01_TODO_01` : un congé issu d'une absence
+  validée pouvait être exposé `valid=false` (drapeau stocké antérieur à la validation de
+  l'indisponibilité). Il apparaissait alors comme non validé et était donc supprimé par
+  « Supprimer tous ». De plus, la garde backend (`existingValidKeys` de `CraService.save`)
+  s'appuyait uniquement sur le drapeau stocké : un client qui retirait un événement de congé couvert
+  par une indisponibilité validée n'était pas arrêté.
+
+**Correctifs**
+- Frontend : aucun changement de comportement ; ajout d'un test de non-régression sur le cas réel
+  (jour `LEAVE` couvert par une absence validée portant un congé `valid=true` + un autre événement
+  non validé → après « Supprimer tous », le congé reste, le non validé disparaît).
+- Backend `CraService.save` : pour un consultant, `existingValidKeys` compte désormais comme validés
+  les événements des jours couverts par une indisponibilité validée (`validatedUnavailabilityDates`
+  + jour `LEAVE`/`SICK_LEAVE`), même si le drapeau stocké est resté `false`. Retirer un tel
+  événement renvoie donc `400` « Impossible de modifier une activité validée », y compris sans passer
+  par l'IHM. La projection `toDto` de `01_TODO_01` garantit par ailleurs que le front reçoit
+  `valid=true` et ne propose pas ces événements à la suppression.
+
+**Tests ajoutés** (1 backend, 1 frontend)
+- `CraServiceTest.save_consultantCannotRemoveCoveredAbsenceEvent_evenWithStaleFlag` : donnée
+  historique (drapeau `false`) + requête qui retire le congé du jour couvert → `400`.
+- `CraDetail.test.tsx` « le propriétaire (consultant) conserve un congé validé sur un jour
+  d'absence (supprimer tous) » : le congé validé survit à « Supprimer tous », l'événement non
+  validé est retiré.
+
+**Vérification** : backend — `CraServiceTest` 78/78 ; **suite complète 383 tests**, seul échec
+`SecurityIntegrationTest.adminCannotDeleteActiveUser` — pré-existant et order-dependent (vert en
+isolation). Frontend — 24 fichiers / 208 tests OK, oxlint 0 erreur. Aucun changement de schéma.
+
+### 2026-10-01 11:00:11 — Erreurs front signalées : proxy Vite `ECONNREFUSED` et avertissement Node (01_TODO_03)
+
+**Rappel de la demande**
+- « corriger éventuellement erreurs front » : log Vite avec `http proxy error:
+  /api/notifications/unread-count`, `/api/public/i18n?lang=fr`, `/api/auth/me`
+  (`AggregateError [ECONNREFUSED]`) et avertissement « You are using Node.js 22.0.0. Vite requires
+  Node.js version 20.19+ or 22.12+ ».
+
+**Analyse**
+- Les `ECONNREFUSED` ne sont pas un bug applicatif : le proxy Vite (`vite.config.ts` →
+  `http://localhost:8080`) relevait simplement un backend **arrêté** (redémarrage en cours au
+  moment du log). Vérification après redémarrage : `/api/public/i18n?lang=fr` → **200**,
+  `/api/auth/me` → **401**, `/api/notifications/unread-count` → **401** (joignables ; 401 = non
+  authentifié, pas injoignable).
+- L'avertissement Node vient du shell de dev qui résolvait un Node 22.0.0 au lieu du Node documenté
+  `c:/pgm/nvm/v22.12.0` (AGENTS.md).
+
+**Correctif** (frontend uniquement)
+- `soc360-front-react/run_dev.sh` : préfixe le `PATH` avec `${SOC360_NODE_DIR:-/c/pgm/nvm/v22.12.0}`
+  lorsqu'il existe, pour que `npm.cmd run dev` utilise le Node 22.12.0 documenté et fasse disparaître
+  l'avertissement Vite. Syntaxe vérifiée (`bash -n`) et résolution confirmée (`node --version` →
+  `v22.12.0`).
+- Aucun changement de code applicatif, de schéma ou de configuration Vite : les erreurs de proxy
+  n'existaient que backend éteint.
+
+**Vérification** : backend laissé démarré (H2, profil local) — les 3 endpoints proxifiés répondent.
+Frontend — 24 fichiers / 208 tests OK, oxlint 0 erreur, `npm run build` OK.
+
+### 2026-10-01 11:08:49 — Pourquoi ces erreurs à la console du serveur front (proxy Vite `ECONNREFUSED` + Node) (01_TODO_01)
+
+**Rappel de la demande**
+- « pourquoi ces erreurs sur la console de démarrage du server front » : `[vite] http proxy error:
+  /api/notifications/unread-count` / `/api/public/i18n?lang=fr` / `/api/auth/me`
+  (`AggregateError [ECONNREFUSED]`) et « You are using Node.js 22.0.0. Vite requires Node.js version
+  20.19+ or 22.12+ ».
+
+**Réponse (analyse)**
+- `[vite] http proxy error ... ECONNREFUSED` n'est **pas un bug applicatif**. `vite.config.ts`
+  proxifie tout `/api` vers le backend Spring Boot `http://localhost:8080`. `ECONNREFUSED` est une
+  erreur TCP « connexion refusée » : personne n'écoutait sur le port 8080 à cet instant (backend
+  arrêté/redémarrage). Le front, dès son montage, appelle immédiatement `/api/public/i18n`,
+  `/api/auth/me` puis `/api/notifications/unread-count` (et réessaie), d'où la rafale de messages à
+  10:53:19-20 — le backend était down pendant sa relance — puis un dernier à 11:00:57.
+- L'avertissement Node venait du shell de dev résolvant un Node 22.0.0 au lieu du Node documenté
+  `c:/pgm/nvm/v22.12.0` (AGENTS.md).
+
+**Preuve / correction**
+- Backend démarré : `/api/public/i18n?lang=fr` en direct → **200**, et **à travers le proxy Vite**
+  (`http://localhost:5173/api/public/i18n?lang=fr`) → **200**, **aucun** `proxy error` dans la
+  console Vite. Les erreurs n'apparaissent donc que backend éteint.
+- `soc360-front-react/run_dev.sh` : au démarrage, teste la joignabilité du backend
+  (`curl --max-time 2 http://localhost:8080/api/public/i18n?lang=fr`) et, si injoignable, affiche
+  une note expliquant que les `http proxy error ... ECONNREFUSED` tant que `soc360-back-java/run_dev.sh`
+  n'est pas lancé (message clair au lieu de la pile `AggregateError`). Le fix Node du run_dev.sh
+  (tâche précédente) est conservé.
+- Aucun changement de code applicatif, de schéma ou de `vite.config.ts` : le proxy est correct.
+
+**Vérification** : `bash -n run_dev.sh` OK ; condition testée (backend joignable → pas de note ;
+`curl` sur un port fermé → code 28 donc note affichée) ; `node --version` via `run_dev.sh` →
+`v22.12.0` (plus d'avertissement Vite). Frontend — 24 fichiers / 208 tests OK, oxlint 0 erreur.
+
+### 2026-10-01 11:31:42 — Le manager peut invalider les indispos d'un consultant de son équipe (01_TODO_01)
+
+**Rappel de la demande**
+- « le manager d'un user, peut invalider les indispos de ce user ».
+
+**Constat**
+- Le manager pouvait valider (`SUBMITTED`/`REJECTED` → `VALIDATED`) ou rejeter (`SUBMITTED` →
+  `REJECTED`) une indisponibilité, mais **rien** ne permettait de revenir sur une indisponibilité
+  déjà **validée** : aucun bouton dans l'IHM (`canReview` ne s'appliquait qu'à `SUBMITTED`) et le
+  backend refusait (`reject` exige `SUBMITTED`). Une validation erronée était donc irréversible.
+
+**Implémentation**
+- Backend `UnavailabilityService.invalidate(id, comment)` : une indisponibilité `VALIDATED` repasse
+  en `REJECTED` (motif enregistré, `validatedAt` effacé), historisée (« Invalidation ») et notifiée
+  au consultant (« Indisponibilité invalidée » + email `UNAVAILABILITY_REJECTION`). Elle redevient
+  alors modifiable / soumettable par le consultant (`requireEditable` accepte `REJECTED`).
+  Garde-fou `requireValidatable` non concerné ; nouvelle `requireManager` mise à jour.
+- Backend `UnavailabilityController` : `POST /api/unavailabilities/{id}/invalidate`
+  (`ADMIN` / `RESPONSIBLE_SOC` / `MANAGER`), corps `DecisionRequest` optionnel.
+- Backend `markLinkedTimesheetEvents(..., valid)` : factorisation de
+  `markLinkedTimesheetEventsValid` ; l'invalidation appelle `markLinkedTimesheetEventsInvalid`
+  qui dé-valide les **congés** des jours couverts dans le CRA rattaché (une mission validée sur le
+  même jour est préservée). Le CRA redevient ainsi modifiable et `requireLinkedAbsencesValidated`
+  bloque de nouveau sa validation tant que l'absence n'est pas re-validée.
+- Frontend `api/unavailability.ts` : `invalidate(id, comment)`.
+- Frontend `pages/Unavailability.tsx` : `canInvalidate` (non-consultant + statut `VALIDATED`),
+  `handleInvalidate` (motif via `dialog.prompt`) et bouton « Invalider » dans la liste.
+- i18n : clés `Unavailability.invalider` et `Unavailability.motif.de.l.invalidation` (FR/EN/AR) dans
+  `messages.generated.ts` **et** Flyway `V96__i18n_unavailability_invalidate.sql` (table
+  `app_language`, servie par `/api/public/i18n`).
+- Isolation multi-société : inchangée (accès via `SecurityUtils.requireSocAccess` dans
+  `getAccessible` ; l'endpoint reste réservé aux rôles non-CONSULTANT).
+
+**Tests ajoutés** (3 backend, 2 frontend)
+- `UnavailabilityServiceTest.invalidate_validatedByManager_transitionsToRejectedAndClearsValidatedAt`.
+- `UnavailabilityServiceTest.invalidate_byConsultant_isForbidden`.
+- `UnavailabilityServiceTest.invalidate_nonValidated_isRejected` (`SUBMITTED` refusé).
+- `CraServiceTest.invalidateLinkedAbsence_marksCraEventsInvalidAgain` : après validation de
+  l'absence liée les congés du CRA sont validés, après invalidation ils redeviennent non validés et
+  l'indispo est `REJECTED`.
+- `Unavailability.test.tsx` : le manager invalide une indispo validée avec motif ; l'action
+  « Invalider » n'est **pas** exposée à un consultant.
+
+**Vérification** : backend — `CraServiceTest` 79/79, `UnavailabilityServiceTest` 35/35 ; **suite
+complète 387 tests**, seul échec `SecurityIntegrationTest.adminCannotDeleteActiveUser` — pré-existant
+et order-dependent (vert en isolation). Frontend — 24 fichiers / 210 tests OK, oxlint 0 erreur,
+`npm run build` OK.
+Vérification live (backend redémarré, Flyway migré en **V96**) : `dev1`/`manager1` —
+`POST /api/unavailabilities/303/invalidate` par le consultant → **403** ; par le manager →
+**200 `REJECTED`**, `validatedAt=null`, `rejectedReason="Erreur de saisie"` ; le jour de congé du CRA
+626 rattaché repasse `valid=false` / `unavailable=false` ; `/api/public/i18n?lang=fr` sert bien
+`Unavailability.invalider="Invalider"` et `Unavailability.motif.de.l.invalidation`. Données de test :
+absence 303 désormais `REJECTED` (inertes, CRA 626 toujours en l'état).
+
+### 2026-10-01 11:41:50 — Rejeter une indispo d'un CRA rejette le CRA, même s'il était validé (01_TODO_01)
+
+**Rappel de la demande**
+- « si le manager d'un cra rejette une indispo contenue dans un cra, alors le cra devient rejeté
+  même s'il était déjà validé ».
+
+**Constat**
+- Rejeter/invalider une indisponibilité rattachée à un CRA (`reject` ou `invalidate`) ne touchait pas
+  le CRA : un CRA déjà `VALIDATED` restait `VALIDATED`. Pire, `CraService.syncStatusFromEvents`
+  (appelé par `getById`) recalcule le statut à partir des événements, qui restaient valides, et
+  aurait **re-promu** le CRA en `VALIDATED` même après un rejet.
+
+**Implémentation**
+- Backend `UnavailabilityService.rejectLinkedTimesheet(unavailability, label, note)` : si l'indispo
+  est rattachée à un CRA (`timesheet`), le CRA repasse en `REJECTED` (`validatedAt` effacé, commentaire
+  « Indisponibilité rejetée/invalidée », entrée `timesheet_history`). Appelée depuis `reject` et
+  `invalidate`. Nouvelle dépendance `CraHistoryRepository` (pas de cycle : c'est un repository).
+- Backend `CraService.recomputeStatusFromEvents` : lorsqu'aucun événement n'est invalide et qu'une
+  **absence liée est en attente** (`DRAFT`/`SUBMITTED`/`REJECTED`), le CRA n'est plus promu
+  `VALIDATED`. En écriture (`enforceLinkedAbsences=true`) le comportement existant est conservé
+  (`requireLinkedAbsencesValidated` lève 400) ; en **lecture** (`syncStatusFromEvents`) le CRA
+  repasse `REJECTED` au lieu de retomber `VALIDATED`. Refactor `hasPendingLinkedAbsences(cra)`
+  partagé avec `requireLinkedAbsencesValidated`.
+- Aucun changement de schéma (Flyway inchangé) ni de frontend ; isolation multi-société inchangée
+  (`getAccessible` → `requireSocAccess`, endpoint réservé aux rôles non-CONSULTANT).
+
+**Tests ajoutés** (2 backend)
+- `CraServiceTest.invalidateLinkedAbsence_rejectsTheContainingCraEvenWhenValidated` : CRA validé +
+  indispo validée → `invalidate` → statut du CRA en base immédiatement `REJECTED`, et toujours
+  `REJECTED` après relecture (`getById` ne le re-promeut pas).
+- `CraServiceTest.rejectLinkedAbsence_rejectsTheContainingCra` : CRA soumis + indispo soumise →
+  `reject` → CRA `REJECTED`.
+  Les deux échouent sans le correctif (vérifié en retirant les appels `rejectLinkedTimesheet`).
+
+**Vérification** : backend — `CraServiceTest` 81/81, `UnavailabilityServiceTest` 35/35 ; **suite
+complète 389 tests**, seul échec `SecurityIntegrationTest.adminCannotDeleteActiveUser` — pré-existant
+et order-dependent (vert en isolation). Frontend — inchangé : 24 fichiers / 210 tests OK.
+Vérification live (backend redémarré sur H2, profil local) : `dev1`/`manager1`, CRA mai 2027 —
+absence déclarée → soumise → validée par le manager → CRA **VALIDATED** → « Invalider » l'absence →
+CRA **REJECTED** à la relecture ; second scénario, CRA juin 2027 soumis → « Rejeter » l'absence →
+CRA **REJECTED**. Données de test laissées inertes : CRA 658 (rejeté, absence 367 `REJECTED`) et
+CRA 659 (juin 2027, rejeté, absence `REJECTED`).
+
+### 2026-10-01 15:15:41 — soc-72 : prise en compte de la date d'embauche dans le CRA et les indisponibilités (01_TODO_01)
+
+**Rappel de la demande**
+- Sans date d'embauche, le consultant ne peut ni renseigner un CRA / une indisponibilité, ni
+  consulter ses activités.
+- La saisie d'un CRA / d'une indisponibilité n'est possible qu'à partir de la date d'embauche.
+- Dans la navigation, la date de début correspond à la date d'embauche.
+- Si l'embauche n'est pas le 1er du mois, la période du mois précédant l'embauche est grisée avec
+  une info-bulle « date d'embauche … ».
+
+**Implémentation**
+- Backend `DayType` : nouvelle valeur `BEFORE_HIRE` (aucune migration de schéma, colonne `varchar` ;
+  les exports CSV/PDF stringifient `.name()` et les compteurs ignorent ce type).
+- Backend `CraService` :
+  - `createForMonth` marque `BEFORE_HIRE` (0 h) tout jour antérieur à `UserAccount.hireDate`.
+  - `markBeforeHireDays` re-force ces jours (et vide leurs activités) à chaque `getOrCreate` d'un CRA
+    brouillon → corrige aussi les données historiques.
+  - `save` force `BEFORE_HIRE` pour tout jour antérieur à l'embauche, quel que soit le payload client
+    (les activités de ces jours sont ignorées) ; les totaux/complétude ne comptent que `WORKED`.
+  - `declareAbsence` refuse une absence commençant avant la date d'embauche.
+  - `requireHireDateForSelf` : le consultant qui saisit lui-même son CRA doit avoir renseigné sa date
+    d'embauche (`getOrCreate`, `save`, `submit`).
+- Backend `UnavailabilityService.requireOnOrAfterHireDate` : refuse une indisponibilité antérieure à
+  la date d'embauche ; un consultant sans date d'embauche est bloqué (les managers saisissent pour un
+  collaborateur dont la fiche porte la date). Appelé dans `create` et `update`.
+- Backend DTO : `hireDate` ajouté à `UserDtos.UserDto` (`/auth/me`), à `CraDtos.CraDto` (info-bulle
+  côté manager consultant) et à `ConsultantSummary` (min du formulaire d'indispo).
+- Frontend `types.ts` / `format.ts` : `DayType 'BEFORE_HIRE'`, `hireDate` sur `UserDto`/`CraDto`/
+  `ConsultantSummary`, libellé `BEFORE_HIRE = 'Avant embauche'`.
+- Frontend `CraDetail.tsx` : jour `BEFORE_HIRE` grisé (`bg-gray-200`), info-bulle « Avant la date
+  d'embauche ({date}) » (calendrier et vue Ligne), type de jour non modifiable et bouton
+  « Ajouter un événement » masqué ; « Déclarer une absence » bornée à la date d'embauche.
+- Frontend `CraList.tsx` / `IndispoList.tsx` : création bloquée sans date d'embauche (message),
+  navigation de période démarrant à la date d'embauche (mois initial + bouton précédent désactivé
+  avant l'embauche).
+- Frontend `Unavailability.tsx` : bouton « Nouvelle indisponibilité » désactivé sans date d'embauche,
+  `min` des dates = date d'embauche (soi-même ou collaborateur choisi), validation avant envoi.
+- Frontend `MyActivities.tsx` : consultation des activités bloquée sans date d'embauche.
+- i18n : clés `CraDetail.avant.embauche`, `hireDate.required`, `hireDate.required.activities`,
+  `Unavailability.date.embauche` (FR/EN/AR) dans `messages.ts` + Flyway `V97__i18n_hire_date.sql`.
+- Isolation multi-société inchangée.
+
+**Tests ajoutés** (6 backend, 4 frontend)
+- Backend : `CraServiceTest.createForMonth_marksDaysBeforeHireAsBeforeHire`,
+  `getOrCreate_consultantWithoutHireDate_isRejected`, `declareAbsence_beforeHireDate_isRejected`,
+  `save_forcesBeforeHireDays` ; `UnavailabilityServiceTest.create_beforeHireDate_isRejected`,
+  `create_consultantWithoutHireDate_isRejected`.
+- Frontend : `CraDetail.test.tsx` « grise les jours antérieurs à la date d'embauche avec une
+  info-bulle » ; `MyActivities.test.tsx` « bloque la consultation des activités sans date
+  d'embauche » ; `Unavailability.test.tsx` « désactive la création d'indisponibilité sans date
+  d'embauche ». Fixtures consultants mises à jour avec une date d'embauche.
+
+**Vérification** : backend — suite complète **395 tests**, seul échec
+`SecurityIntegrationTest.adminCannotDeleteActiveUser` — pré-existant et order-dependent (vert en
+isolation) ; `CraServiceTest` 85/85, `UnavailabilityServiceTest` 37/37. Frontend — 24 fichiers /
+**213 tests**, oxlint 0 erreur, `npm run build` OK.
+Vérification live (backend redémarré, Flyway migré en **V97**) : consultant créé avec embauche au
+**15/05/2027** → CRA mai 2027 : 14/05 `BEFORE_HIRE`, 15/05 non `BEFORE_HIRE` ; indispo du 10/05 →
+**400** « ne peut pas commencer avant la date d'embauche », du 20/05 → **200** ; date d'embauche
+retirée → CRA (getOrCreate) **400** « Renseignez votre date d'embauche… » et indispo **400** ;
+`/api/cras/all` expose bien `hireDate` ; `/api/public/i18n?lang=fr` sert les nouvelles clés.
+Données de test laissées inertes : consultant `hired…` (sans date d'embauche à l'issue du test), une
+absence brouillon, CRA 690.
+
+### 2026-10-01 15:27:09 — soc-72 (suite) : interdire les périodes antérieures à l'embauche via les listes de mois / années (01_TODO_01)
+
+**Rappel de la demande**
+- Suite de soc-72 : le consultant ne doit pas pouvoir choisir une date antérieure à sa date
+  d'embauche **via la liste des mois et la liste des années** (pas seulement via les flèches).
+
+**Implémentation** (frontend uniquement — `CraList.tsx`, `IndispoList.tsx`)
+- `openPeriod(y, m)` borne désormais la navigation : toute période antérieure à l'embauche est
+  ramenée au mois d'embauche (couvre les `<Select>` mois/année, les flèches et tout autre appel).
+- La liste des **années** ne propose plus les années antérieures à l'année d'embauche
+  (`allowedYears = [now-1, now, now+1].filter(y >= hirePeriod.year)`).
+- La liste des **mois** ne propose plus, dans l'année d'embauche, les mois antérieurs
+  (`allowedMonths` filtré sur `hirePeriod.month`).
+- Aucun changement backend, de schéma ni d'i18n ; isolation multi-société inchangée.
+
+**Tests ajoutés** (1 frontend)
+- `CraList.test.tsx` « n'autorise pas de période antérieure à la date d'embauche (listes
+  mois/années) » : consultant embauché au 15/08 de l'année courante → « Août » présent mais
+  « Juillet »/« Janvier » absents, année précédente absente, année d'embauche présente.
+
+**Vérification** : frontend — 24 fichiers / **214 tests** OK, oxlint 0 erreur, `npm run build` OK.
+Backend inchangé (dernière suite connue : 395 tests, seul échec pré-existant
+`SecurityIntegrationTest.adminCannotDeleteActiveUser`).
+
+### 2026-10-01 15:38:17 — page CRA : internationaliser le titre « CRA de {consultant} » (01_TODO_01)
+
+**Rappel de la demande**
+- Page CRA : internationaliser la phrase du style « CRA de mourad zamoun ».
+
+**Constat**
+- Le titre de `CraDetail` était codé en dur en français :
+  `{cra.type === 'CONGE' ? 'Indispo de ' : 'CRA de '}{cra.consultantName}`.
+
+**Implémentation**
+- Frontend `CraDetail.tsx` : le titre passe par `tr(...)` avec interpolation du nom
+  (`CraDetail.titre.cra` → « CRA de {name} », `CraDetail.titre.indispo` → « Indispo de {name} »).
+- i18n : clés ajoutées FR/EN/AR dans `messages.ts` **et** Flyway
+  `V98__i18n_cra_detail_title.sql` (table `app_language`, servie par `/api/public/i18n`).
+- Aucun changement de schéma métier, ni d'isolation multi-société.
+
+**Tests ajoutés** (1 frontend)
+- `CraDetail.test.tsx` « internationalise le titre de la page CRA (« CRA de … ») » : le titre rendu
+  est « CRA de Alice Martin ».
+
+**Vérification** : frontend — 24 fichiers / **215 tests** OK, oxlint 0 erreur, `npm run build` OK.
+Backend — migration V98 validée (`CraServiceTest` 85/85 + `Soc360ApplicationTests`, contexte Spring
++ Flyway OK). Live (backend redémarré, Flyway **V98**) : `/api/public/i18n?lang=fr` sert
+« CRA de {name} » / « Indispo de {name} » ; `?lang=en` sert « Timesheet of {name} » /
+« Unavailability of {name} ».
+
+### 2026-10-01 15:42:58 — page CRA : internationaliser la valeur du statut des absences (01_TODO_02)
+
+**Rappel de la demande**
+- Page CRA : internationaliser la valeur du statut des absences (« Brouillon », « Soumise »,
+  « Validée », « Rejetée »).
+
+**Constat**
+- Le panneau « Absences déclarées » de `CraDetail` affichait le statut via
+  `tr(UNAVAILABILITY_STATUS_LABELS[absence.status])` : `UNAVAILABILITY_STATUS_LABELS` renvoie des
+  **libellés français**, passés comme **clé** à `tr`, laquelle n'existe pas → la valeur affichée
+  restait toujours le libellé français, quelle que soit la langue.
+
+**Implémentation**
+- Frontend `lib/format.ts` : nouvelle table `UNAVAILABILITY_STATUS_KEYS` (statut → clé i18n) en plus
+  de `UNAVAILABILITY_STATUS_LABELS` (qui reste utilisée pour la recherche/filtre).
+- Frontend `CraDetail.tsx` : les deux affichages du statut d'absence (panneau et popup
+  « Indisponibilités à valider ») utilisent `tr(UNAVAILABILITY_STATUS_KEYS[status])`.
+- i18n : clés `Unavailability.status.DRAFT|SUBMITTED|VALIDATED|REJECTED` (FR/EN/AR) dans
+  `messages.ts` + Flyway `V99__i18n_unavailability_status_labels.sql` (`app_language`).
+- Aucun changement de schéma métier, ni d'isolation multi-société. Les libellés FR restent
+  identiques (« Brouillon », « Soumise », « Validée », « Rejetée »).
+
+**Tests ajoutés** (1 frontend)
+- `i18n.test.tsx` « traduit les statuts d'indisponibilité dans les 3 langues » : les 4 clés existent
+  et sont traduites en FR/EN/AR (`en VALIDATED = Approved`, `fr REJECTED = Rejetée`), et ne
+  contiennent pas la clé brute. Les tests existants de `CraDetail` (badges « Soumise »,
+  « Validée »…) restent verts.
+
+**Vérification** : frontend — 24 fichiers / **216 tests** OK, oxlint 0 erreur, `npm run build` OK.
+Backend — migration V99 validée (`Soc360ApplicationTests`, contexte Spring + Flyway). Live (backend
+redémarré, Flyway **V99**) : `/api/public/i18n?lang=fr` sert Brouillon/Soumise/Validée/Rejetée ;
+`?lang=en` sert Draft/Submitted/Approved/Rejected.
+
+### 2026-10-01 15:58:13 — soc-75 : indisponibilité interdite sur un mois dont le CRA est déjà soumis/validé (01_TODO_01)
+
+**Rappel de la demande**
+- Un consultant ne peut pas ajouter une indisponibilité sur un mois X si, pour ce mois X, son CRA est
+  déjà soumis ou validé.
+
+**Constat**
+- `UnavailabilityService.create` / `update` n'effectuaient aucun contrôle du statut du CRA du
+  consultant sur les mois couverts : une absence pouvait être ajoutée alors que le CRA du mois était
+  déjà `SUBMITTED` ou `VALIDATED` (donc potentiellement en cours de validation ou validé).
+
+**Implémentation** (backend uniquement)
+- `UnavailabilityService` : injection de `CraRepository` et nouvelle garde
+  `assertNoSubmittedOrValidatedCra(consultantId, start, end)` — pour chaque mois recouvert par
+  l'intervalle, si `findByConsultantIdAndMonthAndYearAndType(..., "CRA")` renvoie un CRA
+  `SUBMITTED`/`VALIDATED`, la demande est refusée (`400` « … le CRA de <MOIS AAAA> est déjà soumis
+  ou validé »). Appelée dans `create` (sur l'intervalle fusionné) et `update`.
+- Un CRA `DRAFT`/`REJECTED` reste ouvert (l'absence peut y être intégrée) ; `declareLinkedAbsence`
+  (déclaration depuis le remplissage du CRA) n'est concerné que pour les CRA `DRAFT`/`REJECTED`.
+- Aucun changement de schéma (Flyway inchangé) ni de frontend : l'erreur est affichée par
+  `Unavailability.tsx` (`formError`). Isolation multi-société inchangée.
+
+**Tests ajoutés** (2 backend)
+- `UnavailabilityServiceTest.create_whenCraSubmittedForTheMonth_isRejected` : CRA `SUBMITTED` sur le
+  mois → `400` « soumis ou validé », aucun enregistrement.
+- `UnavailabilityServiceTest.create_whenCraIsDraft_isAllowed` : CRA `DRAFT` → création `200`.
+- Ajout du mock `CraRepository` au test unitaire.
+
+**Vérification** : backend — `UnavailabilityServiceTest` 39/39, `CraServiceTest` 85/85 ; **suite
+complète 397 tests**, seul échec `SecurityIntegrationTest.adminCannotDeleteActiveUser` — pré-existant
+et order-dependent (vert en isolation). Frontend inchangé (dernière suite : 216 tests).
+Vérification live (backend redémarré) : consultant embauché 2020 → CRA 2027-08 rempli et **soumis**
+→ indispo 10-12/08 → **400** « le CRA de AUGUST 2027 est déjà soumis ou validé » ; indispo sur un
+mois **sans CRA** (09/2027) → **200** ; indispo sur un mois à CRA **brouillon** (07/2027) → **200**.
+Données de test laissées inertes : consultant `soc75_…`, CRA 07/2027 `DRAFT`, CRA 08/2027
+`SUBMITTED`, absences brouillon 07 et 09/2027.
+
+### 2026-10-01 16:24:07 — soc-75 (correctif) : une absence d'octobre ne doit pas être bloquée par le CRA de septembre (01_TODO_01)
+
+**Rappel de la demande**
+- Le 01/10/2026, un consultant ayant un CRA **validé** en 09/2026 et **aucun** CRA soumis/validé en
+  10/2026 voit sa demande d'indispo 01/10/2026 → 08/10/2026 refusée avec « le CRA de SEPTEMBER 2026
+  est déjà soumis ou validé ». Ce n'est pas normal.
+
+**Cause racine**
+- `assertNoSubmittedOrValidatedCra` était appliqué à l'intervalle **fusionné** (`interval.start()` /
+  `interval.end()`). Or `mergeContiguousDrafts` absorbe les brouillons contigus : le consultant avait
+  un brouillon au **30/09/2026**, contigu au 01/10 demandé. L'intervalle fusionné devenait
+  30/09 → 08/10, donc couvrait septembre → refus. Le consultant n'ajoutait pourtant rien en septembre.
+
+**Correctif** (backend uniquement — `UnavailabilityService`)
+- Le contrôle porte désormais sur l'intervalle **demandé** (`request.startDate()` /
+  `request.endDate()`), dans `create` comme dans `update`. La fusion de brouillons contigus reste
+  inchangée (un brouillon du 30/09 peut être absorbé dans une indispo d'octobre, sans bloquer).
+- La règle soc-75 reste effective quand la période **demandée** couvre un mois verrouillé.
+- Aucun changement de schéma ni de frontend ; isolation multi-société inchangée.
+
+**Tests ajoutés** (1 backend)
+- `UnavailabilityServiceTest.create_requestedMonthAllowed_evenIfContiguousDraftIsInLockedMonth` :
+  brouillon 30/09 + CRA 09 `VALIDATED`, demande 01/10→08/10 → création **200**. Échoue sans le
+  correctif (vérifié en revenant à l'intervalle fusionné).
+
+**Vérification** : backend — `UnavailabilityServiceTest` 40/40 ; **suite complète 398 tests**, seul
+échec `SecurityIntegrationTest.adminCannotDeleteActiveUser` — pré-existant et order-dependent (vert en
+isolation). Frontend inchangé (dernière suite : 216 tests).
+Vérification live (backend redémarré) : consultant fraîchement créé — brouillon 30/09/2027 + CRA
+09/2027 rempli et **validé** par le manager ; indispo **01→08/10/2027** → **200** (intervalle fusionné
+30/09→08/10) alors qu'elle renvoyait 400 avant ; indispo **15→16/09/2027** (mois verrouillé) → **400**
+« le CRA de SEPTEMBER 2027 est déjà soumis ou validé ». Données de test laissées inertes :
+consultant `soc75b_…`, CRA 09/2027 `VALIDATED`, indispo fusionnée 30/09→08/10.
+
+### 2026-10-01 17:39:14 — Page Indisponibilités : commentaire obligatoire + afficher le motif de refus (01_TODO_01)
+
+**Rappel de la demande**
+- Page Indisponibilités, à l'ajout d'une nouvelle indispo : le commentaire est obligatoire.
+- Si l'ajout est impossible, afficher le message expliquant pourquoi.
+
+**Implémentation**
+- Backend `UnavailabilityService` : nouvelle garde `requireComment` (commentaire non vide après
+  `trim`) appliquée dans `create` et `update` → `400` « Le commentaire est obligatoire ». Non
+  appliquée à `declareLinkedAbsence` (absence déclarée depuis le CRA), inchangée.
+- Frontend `Unavailability.tsx` :
+  - `handleSave` refuse un commentaire vide (`Unavailability.commentaire.obligatoire`) avant l'appel ;
+  - libellé du champ commentaire marqué obligatoire (`*`) ;
+  - le bouton « Nouvelle indisponibilité » n'est **plus désactivé** sans date d'embauche : le clic
+    reste possible et `openCreate` affiche le motif (`hireDate.required`) via une boîte de dialogue
+    — l'utilisateur voit donc pourquoi il ne peut pas ajouter (au lieu d'un bouton grisé muet).
+- i18n : clé `Unavailability.commentaire.obligatoire` (FR/EN/AR) dans `messages.ts` + Flyway
+  `V100__i18n_unavailability_comment_required.sql`.
+- Aucun changement de schéma métier, ni d'isolation multi-société.
+
+**Tests ajoutés** (1 backend, 2 frontend)
+- Backend `UnavailabilityServiceTest.create_withoutComment_isRejected` (commentaire blanc → `400`,
+  aucun enregistrement) ; helper `request` doté d'un commentaire pour les autres tests.
+- Frontend `Unavailability.test.tsx` : « exige un commentaire pour créer une indisponibilité »
+  (message affiché, aucun appel API) ; « affiche le motif quand la création est impossible sans date
+  d'embauche » (remplace le test de bouton désactivé). Tests de création/modification ajustés pour
+  saisir un commentaire.
+
+**Vérification** : backend — `UnavailabilityServiceTest` 41/41 ; **suite complète 399 tests**, seul
+échec `SecurityIntegrationTest.adminCannotDeleteActiveUser` — pré-existant et order-dependent (vert en
+isolation). Frontend — 24 fichiers / **217 tests** OK, oxlint 0 erreur, `npm run build` OK.
+Live (backend redémarré, Flyway **V100**) : indispo sans commentaire → **400** « Le commentaire est
+obligatoire » ; avec commentaire → **200 `DRAFT`** ; `/api/public/i18n?lang=fr` sert « Le commentaire
+est obligatoire. », `?lang=en` « The comment is required. ».
+
+### 2026-10-02 10:54:11 — Page CRA : colonne commentaire sans traduction dynamique (01_TODO_01)
+
+**Rappel de la demande**
+- Page CRA : ne plus traduire dynamiquement la colonne commentaire.
+- Mettre dans cette colonne les commentaires saisis lors de la validation, du rejet, etc. des CRA.
+
+**Implémentation**
+- Frontend uniquement (backend inchangé) : les commentaires de validation/rejet sont déjà persistés
+  dans `timesheet.comment` par `CraService.validate` (commentaire généré « CRA validé par … le … »)
+  et `CraService.reject` (motif saisi), et exposés par `CraDto.comment` dans toutes les listes.
+- `CraList.tsx:426` : `dt(cra.comment)` → `cra.comment` (affichage brut, sans traduction à la volée).
+- `CraHistoryModal.tsx:79` : `dt(h.comment)` → `h.comment` (idem pour la colonne commentaire de
+  l'historique ouvert depuis la page CRA).
+- Les libellés de statut continuent d'utiliser `dt()` (`CRA_STATUS_LABELS`) ; seuls les commentaires
+  métier (texte libre) ne sont plus traduits.
+- Aucun changement de schéma (pas de migration Flyway), isolation multi-société inchangée.
+
+**Tests ajoutés** (2 frontend)
+- `CraList.test.tsx` : « affiche le commentaire du CRA sans traduction dynamique » et « affiche le
+  commentaire d'historique sans traduction dynamique » — langue forcée à `en`, traduction mockée, le
+  commentaire doit rester brut et ne jamais être remplacé par la traduction (échouent avant le
+  correctif, vérifié).
+
+**Vérification** : Frontend — 24 fichiers / **219 tests** OK, oxlint 0 erreur, `npm run build` OK.
+Backend inchangé (aucun test à relancer côté Java).
+
+### 2026-10-02 10:59:46 — Page CRA : comptage des jours des événements traduit (01_TODO_02)
+
+**Rappel de la demande**
+- Page CRA : dans chaque jour, le comptage du nombre de jours des événements (ex. « 0 j », « 1 j »)
+  doit être traduit dans la langue sélectionnée.
+
+**Implémentation**
+- Frontend uniquement. `CraDetail.tsx` : le helper `formatDays` (utilisé pour le total de chaque jour,
+  le total de chaque événement et les listes déroulantes de valeurs) concaténait le « j » en dur ;
+  il utilise désormais `tr('CraDetail.j')` (clé i18n déjà présente : « j » en fr/en, « ي » en ar).
+- Comme les libellés de statut, le composant se ré-affiche au changement de langue et le suffixe
+  suit donc la langue sélectionnée. Aucun changement de schéma ni d'isolation multi-société.
+
+**Tests ajoutés** (1 frontend)
+- `CraDetail.test.tsx` : « traduit le comptage des jours des événements dans la langue
+  sélectionnée » — langue forcée à `ar`, on vérifie que les comptages s'affichent en « 1 ي » et plus
+  en « 1 j » (échoue avant le correctif, vérifié).
+
+**Vérification** : Frontend — 24 fichiers / **220 tests** OK, oxlint 0 erreur, `npm run build` OK.
+Backend inchangé.

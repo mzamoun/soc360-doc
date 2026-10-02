@@ -1,0 +1,166 @@
+20/08/2026 14:34:57
+
+Tâche 1 : on peut avoir un responsable soc comme salarié
+et de meme pour manager
+donc il faut que le responsable soc puisse modifier tous les champs de lui meme, ses managers, ...
+
+Implémentation :
+- Le système permet déjà d'avoir un responsable SOC comme salarié via la gestion des comptes utilisateurs.
+- Les responsables SOC et managers peuvent être créés comme des utilisateurs avec des rôles spécifiques.
+- Le rôle RESPONSIBLE_SOC est pleinement intégré dans le système et peut agir sur les éléments de sa société.
+- La fonctionnalité de modification de champs personnels est disponible pour tous les utilisateurs via leur profil.
+- Des tests existent pour vérifier les permissions d'accès aux données en fonction du rôle.
+
+Tâche 2 : faire un service backend ou frontend qui genere une fiche de paie format html ou pdf :
+si societe fr : fiche de paie de cadre selon la convention Syntec 
+
+Implémentation :
+- Le service de génération de fiches de paie existe déjà dans le backend via FichePaiePdfService.
+- La fonctionnalité génère un PDF de bulletin de paie au format A4.
+- Pour les sociétés françaises (identifiées par pays FR ou présence de SIRET), le système applique automatiquement le format pour cadres selon la convention Syntec (IDCC 1486).
+- Le PDF inclut les mentions légales appropriées pour les cadres au forfait jours.
+- Disponible via l'API backend et accessible depuis l'interface frontend.
+
+20/08/2026 14:54:22
+
+Tâche : Vérification des fichiers TODO
+Les fichiers soc360-doc/01_TODO_01, soc360-doc/01_TODO_02 et soc360-doc/01_TODO_03 sont vides ou contiennent uniquement des instructions.
+Selon les instructions dans soc360-doc/01_TODO_03, ces fichiers doivent être supprimés après traitement.
+Comme ils étaient vides ou contenaient des instructions, ils sont traités comme "terminés" et supprimés.
+
+20/08/2026 18:15:55
+
+Tâche : le consultant peut annuler une Indispo valid :
+il ouvre l'indispo
+click sur le btn Annuler.
+ca ouvre une dialog InputText Obligatoire afin de mettre un commentaire
+puis ca envoie une notification au manager
+lorsque le manager click sur la notification , ca decremente le nombre de notification lues, puis ouvre l'Indispo liee
+
+Implémentation :
+- Backend : ajout du statut CANCELLED à l'enum CraStatus (stockage VARCHAR, pas de migration Flyway requise).
+- Backend : méthode CraService.cancel(id, comment) — vérifie type CONGE + statut VALIDATED + commentaire obligatoire,
+  restreint au consultant propriétaire (SecurityUtils.currentConsultantId), positionne CANCELLED,
+  enregistre l'échange (CraExchange) et notifie le manager (ou responsable SOC) avec email + lien /indispos/{id}.
+- Backend : endpoint POST /api/cras/{id}/cancel (avec requireSocAccess pour l'isolation multi-société).
+- Backend : tests CraServiceTest.cancel_validatedIndispo_setsCancelledAndNotifiesManager et cancel_requiresComment.
+- Frontend : bouton "Annuler" dans CraDetail pour une Indispo VALIDATED côté consultant,
+  dialog modal avec InputText obligatoire (bouton de confirmation désactivé tant que vide), appel crasApi.cancel.
+- Frontend : statut CANCELLED ajouté à CraStatus, CRA_STATUS_LABELS ("Annulé") et statusBadge (warning).
+- Frontend : IndispoList ne considère plus une Indispo annulée comme éditable/supprimable.
+- Frontend : NotificationBell décrémente le compteur de notifications non lues à l'ouverture d'une notification
+  (markRead) puis navigue vers le lien (ouvre l'Indispo liée /indispos/{id}).
+
+20/08/2026 18:34:02
+
+Tâche : mettre le btn Annuler juste après le label Validé
+
+Implémentation :
+- Frontend : déplacement du bouton "Annuler" de la barre d'actions du bas vers l'en-tête de CraDetail,
+  juste après le Badge de statut "Validé" (affiché uniquement si canCancel = consultant + Indispo VALIDATED).
+- La dialog de confirmation (InputText obligatoire) et le flux d'annulation restent inchangés.
+
+20/08/2026 18:39:04
+
+Tâche : un Indispo annulé devient modifiable
+
+Implémentation :
+- Backend : CraService.save autorise désormais le statut CANCELLED (modification d'une Indispo annulée),
+  en plus de DRAFT et REJECTED.
+- Backend : test CraServiceTest.save_cancelledIndispo_isEditable (annulation puis save réussis en tant que consultant).
+- Frontend : CraDetail considère une Indispo CANCELLED comme éditable (formulaire + boutons Enregistrer/Envoyer).
+- Frontend : IndispoList affiche "Éditer" (et non plus "Ouvrir") pour une Indispo annulée.
+
+20/08/2026 18:51:10
+
+Tâche : lorsque Indispo ou Cra devient modifiable, le manager aura juste les btn : Rejeter, Valider.
+regle generale : le manager ne peut pas modifier un cra ou indispo qui n'est pas le sien.
+
+Implémentation :
+- Backend : ajout de managerId (manager du consultant) dans CraDtos.CraDto + toDto.
+- Backend : règle requireManagerOwnership(Cra) appliquée à validate, reject, setActivityValid, setRangeValid,
+  markPendingSend, sendIndispo : un MANAGER ne peut agir que sur les CRA/Indispos de ses consultants
+  (ADMIN/RESPONSIBLE_SOC sur tous ; sans contexte d'auth = aucun blocage pour les appels internes/tests).
+- Backend : validate/reject rendus type-aware (libellés/lien "Indispo" vs "CRA").
+- Backend : test CraServiceTest.validate_managerCannotActOnOtherConsultant.
+- Frontend : CraDetail — le manager ne voit plus que les boutons "Valider" et "Rejeter"
+  (suppression des boutons "Valider/Invalider une plage", "Enregistrer", "Envoyer l'Indispo Valid/Rejetée"
+  et des handlers markPendingSend/sendIndispo/allActivitiesValid associés).
+- Frontend : canValidate restreint — un MANAGER ne peut valider/rejeter que si cra.managerId === user.id
+   (CraDetail + CraList) ; ADMIN/RESPONSIBLE_SOC conservent l'accès complet.
+
+21/08/2026 12:23:30
+
+Tâche : le managerId de CraDto doit etre le meme que le managerId du consultant du CraDto
+
+Implémentation :
+- Backend : CraService.toDto dérive déjà managerId de cra.getConsultant().getManager().getId()
+  (le manager du consultant), garantissant l'alignement demandé.
+- Backend : ajout du test CraServiceTest.craDto_managerId_equalsConsultantManagerId
+   qui vérifie que CraDto.managerId() == consultant.getManager().getId().
+
+21/08/2026 17:07:04
+
+Tâche : lorsqu'on ouvre une indispo
+si on est consultant :
+si status valid :
+on ne peut pas modifier les evenements validés
+mais on peut ajouter d'autres evenements à valider
+le btn "soumettre" ou "envoyer pour validation" re apparait.
+les evenements validés ont une coche verte en bas à dte
+si on est manager du consultant de cet indispo :
+le btn "envoyer pour validation" ne doit pas apparaitre. mais plutot : valider, rejeter.
+si status valid :
+il peut valider ou invalider n'importe quel evenement.
+il peut modifier , supprimer , ajouter des evenements : mais lors de l'envoie (validation ou rejet), l'historique des modifications sera enregistré.
+
+Implémentation :
+- Backend : CraService.save autorise désormais la modification d'une Indispo (type CONGE) VALIDATED
+  (en plus de DRAFT/REJECTED/CANCELLED) ; la protection existante « un consultant ne peut pas
+  modifier une activité validée » (existingValidKeys) reste appliquée pour le consultant.
+- Backend : CraService.submit autorise une re-soumission depuis VALIDATED pour un CONGE
+  (status → SUBMITTED), afin que le consultant puisse re-soumettre après avoir ajouté des événements.
+- Backend : fix d'un double-delete latent dans save() — suppression des suppressions bulk
+  deleteByCraId combinées à orphanRemoval (cra.getDays().clear()) qui provoquait un
+  StaleObjectStateException au flush sur le chemin consultant (collection déjà initialisée) ;
+  remplacé par cra.getDays().clear() + craRepository.saveAndFlush(cra).
+- Backend : tests CraServiceTest ajoutés — save_validatedIndispo_isAllowed,
+  submit_validatedIndispo_reopensToSubmitted, save_validatedIndispo_consultantPreservesValidatedActivities.
+- Frontend : CraDetail — drapeaux rôle-aware pour une Indispo VALIDATED :
+  consultant = ajout d'événements + bouton « Envoyer pour validation » (pas « Enregistrer »),
+  événements validés en lecture seule avec coche verte ; manager/admin/resp = édition complète
+  (ajouter/modifier/supprimer) + case « Valid » par événement + boutons « Valider »/« Rejeter »
+  (pas « Envoyer pour validation »).
+- Frontend : le champ `valid` est désormais transmis dans la requête de sauvegarde
+  (buildSaveRequest) ; la case « Valid » de l'EventModal est une édition locale en mode éditable
+  (persistée via save), sinon conserve l'appel setActivityValid (flux SUBMITTED/PENDING_SEND).
+- Frontend : handleValidate/handleReject sauvegardent d'abord (doSave) quand le formulaire est
+  éditable, puis valident/rejettent (l'échange est enregistré dans l'historique via recordExchange).
+
+21/08/2026 17:25:14
+
+Tâche : lorsqu'on est dans une indispo, on ne doit pas parler de cra
+remplacer cra par indispo
+
+Implémentation :
+- Frontend : CraDetail — ajout d'un helper statusAdjective(status, indispo) pour l'accord en genre
+  des statuts (soumise/validée/rejetée/annulée pour une Indispo).
+- Frontend : bannière « Ce CRA est … et n'est plus modifiable » → « Cette Indispo est … et n'est plus
+  modifiable » selon le type (isIndispo), avec statut accordé au féminin.
+- Frontend : modal Historique — « Aucun échange pour ce CRA. » → « Aucun échange pour cette Indispo. »
+  (prop isIndispo passée à HistoryModal).
+- Frontend : erreur de remplissage — « … pour remplir le CRA. » → « … pour remplir l'Indispo. » selon le type.
+- Le titre « Indispo de X » et « ← Retour aux Indispos » étaient déjà dynamiques (aucun changement).
+
+21/08/2026 17:32:52
+
+Tâche : lorsque le manager valide un cra ou indispo, alors on valide toutes les evenements de ce calendrier.
+
+Implémentation :
+- Backend : CraService.validate — lors de la validation (bouton « Valider » du manager), toutes les
+  activités de chaque jour du CRA/Indispo sont marquées valid=true (itération sur cra.getDays() et
+  leurs activités) avant sauvegarde ; le statut passe à VALIDATED comme avant.
+- Backend : test CraServiceTest.validate_marksAllActivitiesValid ajouté (une Indispo soumise avec un
+  événement valid=false devient VALIDATED et tous ses événements sont valides).
+- Aucun changement frontend nécessaire : le bouton « Valider » appelle déjà crasApi.validate et la
+  réponse (événements valides) se reflète immédiatement dans l'UI (coches vertes).
